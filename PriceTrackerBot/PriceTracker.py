@@ -23,9 +23,12 @@ class PriceTracker():
     
     def __init__(self, API_TOKEN):
         self.HEADERS={r'User-Agent': r"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36"}
-        
 
         self.CreateProxyList()
+        while not self.ProxyList:
+            logger.info("Couldn't create ProxyList, retrying...")
+            time.sleep(25)
+            self.CreateProxyList()
         print(self.ProxyList)
         logger.info(str(self.ProxyList))
         self.InitializeDatabase()
@@ -47,27 +50,35 @@ class PriceTracker():
 
 
     def GetAmazonProductInfo(self, link, max_tries=5): #Returns a dictionary with Name, Price, Date, Link
-        link1=self.CorrectLink(link)  #test
-        
+        link=self.CorrectLink(link)  #test
+
         for tries in range(0,max_tries):
             try:
                 try:
                     x=random.randint(0, len(self.ProxyList)-1)
                     proxy=self.ProxyList[x]
                     logger.info("Using proxy: " + str(proxy))
-                    r=requests.get(link, headers=self.HEADERS, proxies={"http": proxy, "https": proxy}, timeout=5.0)
+                    r=requests.get(link, headers=self.HEADERS, proxies={"http": proxy, "https": proxy}, timeout=15.0)
+                    #open('page.html', 'wb').write(r.content) #For debug purposes
+                    
                 except:
+
                     logger.error("Error in proxy list, attempting without proxy")
                     r=requests.get(link, headers=self.HEADERS, timeout=5.0)
                 
-                soup=BeautifulSoup(r.text, 'html.parser')
+                soup=BeautifulSoup(r.text, 'html5lib')  # USE html5lib only, as r may be a broken html page
                 pricetag=soup.find("span", id='priceblock_ourprice')
                 if not pricetag:
                     pricetag=soup.find("span", id='priceblock_saleprice')
                 if not pricetag:
                     pricetag=soup.find("span", id='priceblock_dealprice')
                 nametag=soup.find("span", id="productTitle")
-
+                if not nametag:
+                    logger.error("Cant find name tag of product.")
+                    raise ValueError("No product name.")
+                if not pricetag:
+                    logger.error("Can't find pricetag of price.")
+                    raise ValueError("No product price")
                 logger.info("Name: " + nametag.text.strip())
                 logger.info("Price: " + pricetag.text.strip())
                 return {'Name': nametag.text.strip(),
@@ -76,6 +87,7 @@ class PriceTracker():
                         'Link': link}
             except Exception as e:
                 logger.warning(e)
+                time.sleep(3)
                 pass
         if tries==max_tries-1:
             logger.error("Could not get product info for: " + link)
@@ -93,8 +105,16 @@ class PriceTracker():
         if CorrectedLink.endswith('ref'):
             CorrectedLink=CorrectedLink[:-3]
 
+        if not CorrectedLink.endswith('/'):
+            CorrectedLink=CorrectedLink+'/'
+
         if link.endswith('th=1&psc=1'):
-            CorrectedLink=CorrectedLink+'/&th=1&psc=1?th=1&psc=1'
+            CorrectedLink=CorrectedLink+'&th=1&psc=1?th=1&psc=1/'
+
+
+
+            
+        logger.info("Corrected link: " + CorrectedLink)
         return CorrectedLink
         #try:
         #    customization=re.search("https:\/\/(www\.)?amazon\.\w+\/[a-zA-Z0-9-]+\/\w+\/\w+\/(.*?)(th=1&psc=1)", link).group()
@@ -188,6 +208,11 @@ class PriceTracker():
                 Database=sqlite3.connect("Prices.db")
                 Cursor=Database.cursor()
                 self.CreateProxyList()
+                while not self.ProxyList:
+                    logger.info("Couldn't create ProxyList, retrying...")
+                    time.sleep(60)
+                    self.CreateProxyList()
+
                 logger.info("Database update initiated")
                 Cursor.execute('''select link from products''')
                 ProductLinkList=Cursor.fetchall()
@@ -207,25 +232,31 @@ class PriceTracker():
                     try:    
                         Cursor.execute("SELECT chat_id, product_id, alert_price FROM subscriptions where product_id=(?)", (ProductId[0],))
                         subs=Cursor.fetchall()
-                        
+                        logger.info("Active subscriptions: ")
+                        logger.info(str(subs))
                         Cursor.execute("SELECT id, date, price from '{}'".format(ProductId[0]))
                         
                         PriceDB=Cursor.fetchall()
                         CurrentPrice=PriceDB[len(PriceDB)-1][2]        
                         for sub in subs:
-                            if float(sub[2])>=float(CurrentPrice):
-        
-                                self.TelegramBot.send_message(chat_id=sub[0], text="Price alert! \n\nName:" + ProductId[1] + "\n\nCurrent Price: " + CurrentPrice + "\nHigh: " + ProductId[3]+ "\nLow: " +ProductId[4] + "\nAlert Price: " +sub[2] + "\n\n" +ProductId[2])
-                        
+                            try:
+                                if float(sub[2])>=float(CurrentPrice):
+            
+                                    self.TelegramBot.send_message(chat_id=sub[0], text="Price alert! \n\nName:" + ProductId[1] + "\n\nCurrent Price: " + CurrentPrice + "\nHigh: " + ProductId[3]+ "\nLow: " +ProductId[4] + "\nAlert Price: " +sub[2] + "\n\n" +ProductId[2])
+                                    self.TelegramBot.send_message(chat_id=sub[0], text="You have been unsubscribed from this products updates.")
+                                    Cursor.execute("DELETE FROM subscriptions where chat_id=(?) AND product_id=(?)", (sub[0], sub[1]) )
+                                    logger.info("Sent price update and deleted subscription.")
+                            except Exception as e:
+                                logger.error(e)
                     except Exception as e:
                         logger.error(e)
                 logger.info("Price alerts complete.")
-                
+                Database.commit()
                 Database.close()
                 time.sleep(UpdateFrequency*3600)
 
         ThreadProcess=threading.Thread(target=Updater , args=(UpdateFrequency,) )
-        ThreadProcess.daemon=True
+        ThreadProcess.daemon=False
         ThreadProcess.start()
 
 
@@ -297,7 +328,9 @@ class PriceTracker():
                 #Grabbing IP and corresponding PORT
                 proxy = ":".join([i.xpath('.//td[1]/text()')[0], i.xpath('.//td[2]/text()')[0]])
                 self.ProxyList.append(proxy)
-        logger.info("Proxy list created.")
+        if self.ProxyList:
+            logger.info("Proxy list created.")
+
             
 
             
@@ -500,16 +533,9 @@ class PriceTracker():
 
 t=PriceTracker(API_TOKEN)
 t.PrintDatabase()
-#t.DatabaseAutoupdater()
-#t.AddToDatabase('https://www.amazon.in/Honor-Black-4GB-64GB-Memory/dp/B077PTJT5Z?_encoding=UTF8&ref_=br_isw_strs-4')
-#x=input("LINK: ")
-#print(t.GetProductFromDatabase(x))
+
 t.DatabaseAutoupdater()
 t.InitiateHandlers()
 
-#t.AddPrice(x)
- #x=t.CorrectLink(input("LINK: "))
-
-#t.PrintDatabase()
 
 
